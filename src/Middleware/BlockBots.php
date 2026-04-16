@@ -6,11 +6,12 @@ use Closure;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Redis;
+use Symfony\Component\HttpFoundation\IpUtils;
 use Potelo\LaravelBlockBots\Jobs\CheckIfBotIsReal;
 use Potelo\LaravelBlockBots\Events\UserBlockedEvent;
 use Potelo\LaravelBlockBots\Jobs\ProcessLogWithIpInfo;
 use Potelo\LaravelBlockBots\Abstracts\AbstractBlockBots;
-
+use Potelo\LaravelBlockBots\Events\BotBlockedEvent;
 
 class BlockBots extends AbstractBlockBots
 {
@@ -55,6 +56,9 @@ class BlockBots extends AbstractBlockBots
             event(new UserBlockedEvent(Auth::user(), $this->hits, Carbon::now()));
         }
 
+        if (Auth::guest() && $this->isTheFirstOverflow()) {
+            event(new BotBlockedEvent($this->client->ip, $this->hits, Carbon::now()));
+        }
 
         if ($this->request->expectsJson()) {
             return response()->json($this->options->json_response, 429);
@@ -116,14 +120,21 @@ class BlockBots extends AbstractBlockBots
      */
     public function isWhitelisted()
     {
-        if (Redis::sismember($this->options->whitelist_key, $this->client->ip)) {
+        // Check Redis whitelist using trackable IP (normalized IPv6 prefix)
+        if (Redis::sismember($this->options->whitelist_key, $this->client->trackableIp)) {
             return true;
         }
 
-        //Lets verify if its on our whitelist
-        if (in_array($this->client->ip, $this->options->whitelist_ips)) {
-            //Add this to the redis list as it is faster
-            Redis::sadd($this->options->whitelist_key, $this->client->ip);
+        $ips = $this->options->whitelist_ips;
+
+        if (is_null($this->client->ip)) {
+            return false;
+        }
+
+        // Use original IP for CIDR matching (IpUtils handles both IPv4 and IPv6 CIDR)
+        if (IpUtils::checkIp($this->client->ip, $ips)) {
+            // Add trackable IP to Redis whitelist for faster future checks
+            Redis::sadd($this->options->whitelist_key, $this->client->trackableIp);
             if ($this->options->log) {
                 ProcessLogWithIpInfo::dispatch($this->client, 'WHITELISTED', $this->options);
             }
@@ -181,17 +192,17 @@ class BlockBots extends AbstractBlockBots
         if ($this->isWhitelisted()) {
             return true;
         }
-        //Lets block fake bots
-        if (Redis::sismember($this->options->fake_bot_list_key, $this->client->ip)) {
+        // Block fake bots using trackable IP (normalized IPv6 prefix)
+        if (Redis::sismember($this->options->fake_bot_list_key, $this->client->trackableIp)) {
             return false;
         }
 
         if ($this->isAllowedBot()) {
             // While the bot is on pending_list, it's unchecked, so we allow this bot to pass-thru
-            if (!Redis::sismember($this->options->pending_bot_list_key, $this->client->ip)) {
+            if (!Redis::sismember($this->options->pending_bot_list_key, $this->client->trackableIp)) {
                 // If we got here, it is an unknown bot. Let's create a job to test it
+                Redis::sadd($this->options->pending_bot_list_key, $this->client->trackableIp);
                 CheckIfBotIsReal::dispatch($this->client, $this->getAllowedBots(), $this->options);
-                Redis::sadd($this->options->pending_bot_list_key, $this->client->ip);
             }
 
             return true;
